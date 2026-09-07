@@ -3,7 +3,7 @@
 // reconstructs authoritative state, applies the shared engine, and commits
 // with an optimistic version check inside Postgres.
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { DEFAULT_RULESET, type Card, type GameAction, type GameState, type Player, type Ruleset, type Suit } from '../_shared/types.ts';
+import { DEFAULT_RULESET, type Card, type DeclareSuit, type GameAction, type GameState, type Player, type Ruleset } from '../_shared/types.ts';
 import { applyAction, initializeGame } from '../_shared/reducer.ts';
 import { isPlayable } from '../_shared/rules.ts';
 import { chooseAiAction, chooseAiSuit } from '../_shared/ai.ts';
@@ -75,9 +75,18 @@ function cleanName(name: string | undefined) {
 function normalizeRuleset(ruleset?: Ruleset): Ruleset {
   // Treat the stored ruleset as configuration, not arbitrary executable input.
   return {
+    jokerEnabled: ruleset?.jokerEnabled ?? DEFAULT_RULESET.jokerEnabled,
+    jokerPickup: ruleset?.jokerPickup ?? DEFAULT_RULESET.jokerPickup,
+    aceBlocksPickup: ruleset?.aceBlocksPickup ?? DEFAULT_RULESET.aceBlocksPickup,
+    twoPickup: ruleset?.twoPickup ?? DEFAULT_RULESET.twoPickup,
+    sevenAction: ruleset?.sevenAction ?? DEFAULT_RULESET.sevenAction,
+    jackAction: ruleset?.jackAction ?? DEFAULT_RULESET.jackAction,
     eightsWild: ruleset?.eightsWild ?? DEFAULT_RULESET.eightsWild,
+    kingCarryOn: ruleset?.kingCarryOn ?? DEFAULT_RULESET.kingCarryOn,
+    mixedPickupStacking: ruleset?.mixedPickupStacking ?? DEFAULT_RULESET.mixedPickupStacking,
+    restrictedFirstCards: ruleset?.restrictedFirstCards ?? DEFAULT_RULESET.restrictedFirstCards,
+    restrictedWinningCards: ruleset?.restrictedWinningCards ?? DEFAULT_RULESET.restrictedWinningCards,
     dealRules: { ...DEFAULT_RULESET.dealRules, ...(ruleset?.dealRules ?? {}) },
-    houseRules: { ...DEFAULT_RULESET.houseRules, ...(ruleset?.houseRules ?? {}) },
   };
 }
 
@@ -115,10 +124,12 @@ async function getAuthoritativeState(gameId: string): Promise<GameState> {
     })),
     drawPile: state.draw_pile as Card[],
     discardPile: state.discard_pile as Card[],
-    currentSuit: state.current_suit as Suit | null,
+    currentSuit: state.current_suit as DeclareSuit | null,
     turnSeatIndex: state.turn_seat_index,
     direction: state.direction as 1 | -1,
     hasDrawn: state.has_drawn,
+    carryOn: state.carry_on,
+    pendingPickup: state.pending_pickup,
     pendingEightCardId: state.pending_eight_card_id,
     winnerSeatIndex: state.winner_seat_index,
     version: Number(state.version),
@@ -149,6 +160,8 @@ function toPublicState(game: any, state: GameState, players: DbPlayer[], mySeatI
     drawCount: state.drawPile.length,
     direction: state.direction,
     hasDrawn: state.hasDrawn,
+    pendingPickup: state.pendingPickup,
+    carryOn: state.carryOn,
     winnerSeatIndex: state.winnerSeatIndex,
     version: state.version,
     ruleset: normalizeRuleset(game.ruleset),
@@ -188,7 +201,7 @@ async function snapshotForUser(gameId: string, userId: string) {
     ({ game, players } = await gameRows(gameId));
   }
   const state = game.status === 'lobby'
-    ? ({ phase: 'LOBBY', players: [], drawPile: [], discardPile: [], currentSuit: null, turnSeatIndex: 0, direction: 1, hasDrawn: false, pendingEightCardId: null, winnerSeatIndex: null, version: 0 } as GameState)
+    ? ({ phase: 'LOBBY', players: [], drawPile: [], discardPile: [], currentSuit: null, turnSeatIndex: 0, direction: 1, hasDrawn: false, carryOn: false, pendingPickup: 0, pendingEightCardId: null, winnerSeatIndex: null, version: 0 } as GameState)
     : await getAuthoritativeState(gameId);
   const myHand = state.players.find(p => p.seatIndex === mine.seat_index)?.hand ?? [];
   if (game.status === 'active' && state.phase === 'PLAYING' && state.players.find(p => p.seatIndex === state.turnSeatIndex)?.isAI) {
@@ -212,6 +225,8 @@ async function commitState(gameId: string, oldState: GameState, next: GameState,
       direction: next.direction,
       phase: next.phase,
       hasDrawn: next.hasDrawn,
+      carryOn: next.carryOn,
+      pendingPickup: next.pendingPickup,
       pendingEightCardId: next.pendingEightCardId,
       winnerSeatIndex: next.winnerSeatIndex,
       version: next.version,
@@ -266,6 +281,8 @@ async function createSolo(userId: string, body: Body) {
     direction: state.direction,
     phase: state.phase,
     has_drawn: state.hasDrawn,
+    carry_on: state.carryOn,
+    pending_pickup: state.pendingPickup,
     pending_eight_card_id: state.pendingEightCardId,
     winner_seat_index: null,
     version: state.version,
@@ -345,7 +362,7 @@ async function startGame(userId: string, gameId: string) {
   if (finalPlayers.length < 2) throw new Error('INSUFFICIENT_PLAYERS');
   const ruleset = normalizeRuleset(game.ruleset);
   const state = initializeGame(finalPlayers.map(p => ({ id: p.id, displayName: p.display_name, isAI: p.is_ai, seatIndex: p.seat_index, hand: [], connected: true })), ruleset);
-  await admin.from('crazy_eights_game_state').insert({ game_id: gameId, draw_pile: state.drawPile, discard_pile: state.discardPile, current_suit: state.currentSuit, turn_seat_index: state.turnSeatIndex, direction: state.direction, phase: state.phase, has_drawn: false, pending_eight_card_id: null, version: 1 });
+  await admin.from('crazy_eights_game_state').insert({ game_id: gameId, draw_pile: state.drawPile, discard_pile: state.discardPile, current_suit: state.currentSuit, turn_seat_index: state.turnSeatIndex, direction: state.direction, phase: state.phase, has_drawn: false, carry_on: state.carryOn, pending_pickup: state.pendingPickup, pending_eight_card_id: null, winner_seat_index: null, version: 1 });
   await admin.from('crazy_eights_player_hands').insert(state.players.map(p => ({ player_id: p.id, cards: p.hand })));
   await admin.from('crazy_eights_games').update({ status: 'active', started_at: new Date().toISOString() }).eq('id', gameId);
   await admin.from('crazy_eights_game_events').insert({ game_id: gameId, event_type: 'game_started', payload: { playerCount: finalPlayers.length } });
@@ -414,10 +431,10 @@ async function takeAiTurn(gameId: string) {
   if (!player?.isAI) return false;
   const ruleset = normalizeRuleset(game.ruleset);
 
-  if (before.hasDrawn) {
+  if (before.hasDrawn && before.pendingPickup === 0) {
     const top = before.discardPile[before.discardPile.length - 1];
     const drawn = player.hand[player.hand.length - 1];
-    if (drawn && top && isPlayable(drawn, top, before.currentSuit, ruleset)) {
+    if (drawn && top && isPlayable(drawn, top, before.currentSuit, ruleset, { pendingPickup: before.pendingPickup })) {
       const played = applyAction(before, player.seatIndex, { type: 'PLAY_CARD', cardId: drawn.id }, ruleset);
       if (!played.success) throw new Error(played.error.code);
       await commitState(gameId, before, played.state, played.events);
@@ -505,7 +522,7 @@ Deno.serve(async (req) => {
   } catch (error) {
     const code = error instanceof Error ? error.message : 'INTERNAL_ERROR';
     const known: Record<string, [number, string]> = {
-      GAME_NOT_FOUND: [404, 'Game not found.'], GAME_STATE_NOT_FOUND: [500, 'Game state is unavailable.'], NOT_A_PLAYER: [403, 'You are not a player in this game.'], GAME_NOT_ACTIVE: [409, 'This game is not accepting that action.'], NOT_YOUR_TURN: [409, 'It is not your turn.'], INVALID_PLAY: [400, 'That card cannot be played.'], CARD_NOT_OWNED: [400, 'You do not have that card.'], ALREADY_DREW: [400, 'You may only draw once per turn.'], MUST_DRAW_OR_PLAY: [400, 'Draw a card or play before ending your turn.'], INVALID_SUIT: [400, 'Choose a valid suit.'], SUIT_REQUIRED: [400, 'Choose a suit first.'], LOBBY_FULL: [409, 'That lobby is full.'], LOBBY_BUSY: [409, 'Another player just took that seat. Refresh and try again.'], NOT_HOST: [403, 'Only the host can do that.'], INSUFFICIENT_PLAYERS: [409, 'At least two players are required.'], STALE_GAME_STATE: [409, 'The table changed. Your view will refresh.'], NO_CARDS_AVAILABLE: [409, 'There are no cards left to draw.'], INVALID_MOVE: [400, 'Invalid move.'],
+      GAME_NOT_FOUND: [404, 'Game not found.'], GAME_STATE_NOT_FOUND: [500, 'Game state is unavailable.'], NOT_A_PLAYER: [403, 'You are not a player in this game.'], GAME_NOT_ACTIVE: [409, 'This game is not accepting that action.'], NOT_YOUR_TURN: [409, 'It is not your turn.'], INVALID_PLAY: [400, 'That card cannot be played.'], CARD_NOT_OWNED: [400, 'You do not have that card.'], ALREADY_DREW: [400, 'You may only draw once per turn.'], MUST_DRAW_OR_PLAY: [400, 'Draw a card or play before ending your turn.'], INVALID_SUIT: [400, 'Choose a valid suit.'], SUIT_REQUIRED: [400, 'Choose a suit first.'], LOBBY_FULL: [409, 'That lobby is full.'], LOBBY_BUSY: [409, 'Another player just took that seat. Refresh and try again.'], NOT_HOST: [403, 'Only the host can do that.'], INSUFFICIENT_PLAYERS: [409, 'At least two players are required.'], STALE_GAME_STATE: [409, 'The table changed. Your view will refresh.'], NO_CARDS_AVAILABLE: [409, 'There are no cards left to draw.'], PICKUP_PENDING: [409, 'Respond with an Ace, 2, or Joker, or pick up the cards.'], NO_PICKUP: [409, 'There is no pickup to resolve.'], INVALID_MOVE: [400, 'Invalid move.'],
     };
     const [status, message] = known[code] ?? [500, 'Something went wrong.'];
     if (status >= 500) console.error(error);

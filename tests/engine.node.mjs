@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createDeck } from '../src/engine/deck.ts';
 import { initializeGame, applyAction } from '../src/engine/reducer.ts';
 import { DEFAULT_RULESET } from '../src/engine/types.ts';
-import { isPlayable } from '../src/engine/rules.ts';
+import { canRespondToPickup, isPlayable, isStarterRank, isWinningRank } from '../src/engine/rules.ts';
 import { chooseAiAction, chooseAiSuit } from '../src/engine/ai.ts';
 
 const players = (n) => Array.from({ length: n }, (_, i) => ({
@@ -10,99 +10,192 @@ const players = (n) => Array.from({ length: n }, (_, i) => ({
 }));
 
 const card = (rank, suit) => ({ id: `${rank}-${suit}`, rank, suit });
+const joker = () => card('JOKER', 'jokers');
 const fixedRandom = () => 0.42;
+
+const makeState = (overrides = {}) => {
+  const { hand = [], opponentHands = [[]], ...rest } = overrides;
+  const seats = Math.max(2, 1 + opponentHands.length);
+  const row = Array.from({ length: seats }, (_, i) => ({
+    id: `p${i}`, displayName: `P${i + 1}`, isAI: i > 0, seatIndex: i,
+    hand: i === 0 ? hand : (opponentHands[i - 1] ?? []), connected: true,
+  }));
+  const top = rest.topCard ?? card('7', 'hearts');
+  return {
+    phase: rest.phase ?? 'PLAYING', players: row,
+    drawPile: rest.drawPile ?? [], discardPile: rest.discardPile ?? [top],
+    currentSuit: rest.currentSuit ?? top.suit, turnSeatIndex: rest.turnSeatIndex ?? 0,
+    direction: rest.direction ?? 1, hasDrawn: rest.hasDrawn ?? false,
+    carryOn: rest.carryOn ?? false, pendingPickup: rest.pendingPickup ?? 0,
+    pendingEightCardId: rest.pendingEightCardId ?? null, winnerSeatIndex: rest.winnerSeatIndex ?? null,
+    version: rest.version ?? 1,
+  };
+};
 
 // --- Deck ---
 const deck = createDeck();
-assert.equal(deck.length, 52, 'deck has 52 cards');
-assert.equal(new Set(deck.map(c => c.id)).size, 52, 'deck has no duplicates');
-assert.equal(new Set(deck.map(c => c.suit)).size, 4, 'deck has four suits');
-assert.equal(new Set(deck.map(c => c.rank)).size, 13, 'deck has thirteen ranks');
+assert.equal(deck.length, 54, 'deck has 54 cards');
+assert.equal(new Set(deck.map(c => c.id)).size, 54, 'deck has no duplicate ids');
+assert.equal(deck.filter(c => c.rank === 'JOKER').length, 2, 'deck has two jokers');
 
-// --- Deal ---
+// --- Deal: restricted opening card + 54-card conservation ---
 for (const count of [2, 3, 4, 5, 6]) {
   const state = initializeGame(players(count), DEFAULT_RULESET, fixedRandom);
-  const expected = count <= 3 ? 5 : 4;
-  assert.deepEqual(state.players.map(p => p.hand.length), Array(count).fill(expected), `deal size for ${count} players`);
-  assert.equal(state.discardPile.length, 1, `discard starts with one card for ${count} players`);
-  assert.notEqual(state.discardPile[0].rank, '8', 'starting discard is never an eight');
+  assert.equal(isStarterRank(state.discardPile[0].rank), true, `restricted opener for ${count} players`);
+  const allCards = [...state.players.flatMap(p => p.hand), ...state.drawPile, ...state.discardPile];
+  assert.equal(allCards.length, 54, `deck conserved for ${count} players`);
+  assert.equal(state.pendingPickup, 0, 'initial pickup is zero');
+  assert.equal(state.carryOn, false, 'initial carry-on is false');
 }
 
 // --- Playability ---
 const top = card('7', 'hearts');
 assert.equal(isPlayable(card('K', 'hearts'), top, 'hearts', DEFAULT_RULESET), true, 'suit match playable');
-assert.equal(isPlayable(card('7', 'clubs'), top, 'hearts', DEFAULT_RULESET), true, 'rank match playable');
-assert.equal(isPlayable(card('8', 'spades'), top, 'hearts', DEFAULT_RULESET), true, 'eight always playable');
-assert.equal(isPlayable(card('K', 'clubs'), top, 'hearts', DEFAULT_RULESET), false, 'no-match card rejected');
+assert.equal(isPlayable(joker(), top, 'clubs', DEFAULT_RULESET), true, 'joker always playable');
+assert.equal(isPlayable(card('K', 'hearts'), top, 'hearts', DEFAULT_RULESET, { pendingPickup: 5 }), false, 'king does not bypass pickup');
+assert.equal(isPlayable(card('2', 'spades'), top, 'diamonds', DEFAULT_RULESET, { pendingPickup: 5 }), true, 'pickup response ignores suit');
+assert.equal(canRespondToPickup(card('A', 'spades'), DEFAULT_RULESET), true, 'ace is a response');
+assert.equal(canRespondToPickup(card('8', 'spades'), DEFAULT_RULESET), false, 'eight is not a response');
+assert.equal(isWinningRank('Q'), true, 'Q is a winning rank');
+assert.equal(isWinningRank('K'), false, 'K is not a winning rank');
 
-// --- Invalid play rejected ---
-let state = initializeGame(players(2), DEFAULT_RULESET, Math.random);
-const actor = state.players[0];
-const invalid = actor.hand.find(c => !isPlayable(c, state.discardPile[0], state.currentSuit, DEFAULT_RULESET));
-if (invalid) {
-  const result = applyAction(state, actor.seatIndex, { type: 'PLAY_CARD', cardId: invalid.id }, DEFAULT_RULESET);
-  assert.equal(result.success, false, 'invalid play rejected');
+// --- Joker pickup + auto-resolve when the victim cannot respond ---
+let state = makeState({
+  hand: [joker(), card('5', 'clubs')], opponentHands: [[]], topCard: card('5', 'hearts'),
+  drawPile: [card('3', 'clubs'), card('4', 'diamonds'), card('5', 'spades'), card('6', 'hearts'), card('9', 'clubs')],
+});
+let result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: 'JOKER-jokers' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.success, true, 'joker play succeeds');
+assert.equal(result.state.pendingPickup, 0, 'unanswered pickup auto-resolved');
+assert.equal(result.state.players[1].hand.length, 5, 'victim automatically picked up five cards');
+assert.equal(result.state.turnSeatIndex, 0, 'turn advanced past the victim');
+
+// --- Ace block clears the pile and grants one extra play ---
+state = makeState({
+  hand: [joker(), card('9', 'diamonds')], opponentHands: [[card('A', 'clubs')]], topCard: card('5', 'hearts'),
+});
+result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: 'JOKER-jokers' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.state.players[1].hand.length, 1, 'victim keeps its response card');
+result = applyAction(result.state, 1, { type: 'PLAY_CARD', cardId: 'A-clubs' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.success, true, 'ace block succeeds');
+assert.equal(result.state.pendingPickup, 0, 'ace clears the pickup');
+assert.equal(result.state.carryOn, true, 'blocker completes their turn with one extra play');
+assert.equal(result.state.turnSeatIndex, 1, 'blocker keeps the turn');
+
+// --- 2 stacks onto a Joker (mixed stacking +7) ---
+state = makeState({
+  hand: [joker(), card('9', 'diamonds'), card('A', 'clubs')], opponentHands: [[card('2', 'clubs')]], topCard: card('5', 'hearts'),
+});
+result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: 'JOKER-jokers' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.state.pendingPickup, 5, 'first pickup +5');
+result = applyAction(result.state, 1, { type: 'PLAY_CARD', cardId: '2-clubs' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.success, true, 'two response succeeds');
+assert.ok(result.events.some(e => e.type === 'PICKUP_ADDED' && e.payload?.total === 7), 'mixed stacking totals 7');
+assert.equal(result.state.pendingPickup, 7, 'stacked pickup stays pending');
+
+// --- King gives exactly one extra play, consumed by the next non-King ---
+state = makeState({ hand: [card('K', 'hearts'), card('9', 'hearts'), card('5', 'clubs')], topCard: card('K', 'spades') });
+result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: 'K-hearts' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.state.turnSeatIndex, 0, 'king keeps the same player');
+assert.equal(result.state.carryOn, true, 'exactly one extra play granted');
+result = applyAction(result.state, 0, { type: 'PLAY_CARD', cardId: '9-hearts' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.state.turnSeatIndex, 1, 'non-king play ends the turn');
+assert.equal(result.state.carryOn, false, 'extra play consumed');
+
+// --- K → K → K → normal chain terminates ---
+state = makeState({
+  hand: [card('K', 'hearts'), card('K', 'diamonds'), card('K', 'clubs'), card('3', 'clubs'), card('5', 'spades')],
+  topCard: card('K', 'spades'),
+});
+for (const id of ['K-hearts', 'K-diamonds', 'K-clubs']) {
+  result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: id }, DEFAULT_RULESET, fixedRandom);
+  assert.equal(result.success, true, `${id} plays`);
+  assert.equal(result.state.carryOn, true, 'chain keeps granting one extra play');
+  state = result.state;
 }
+result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: '3-clubs' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.state.carryOn, false, 'normal card consumes the chain');
+assert.equal(result.state.turnSeatIndex, 1, 'turn passes after the chain');
 
-// --- Eight flow ---
-const eight = card('8', 'spades');
-state.players[0].hand = [eight, card('A', 'clubs')];
-const playEight = applyAction(state, 0, { type: 'PLAY_CARD', cardId: eight.id }, DEFAULT_RULESET);
-assert.equal(playEight.success, true, 'eight can be played');
-assert.equal(playEight.state.phase, 'DECLARING_SUIT', 'eight triggers declaring-suit phase');
-assert.equal(playEight.state.turnSeatIndex, 0, 'declarer keeps the turn');
-const suit = applyAction(playEight.state, 0, { type: 'DECLARE_SUIT', suit: 'clubs' }, DEFAULT_RULESET);
-assert.equal(suit.success, true, 'suit declaration succeeds');
-assert.equal(suit.state.currentSuit, 'clubs', 'declared suit is stored');
-assert.equal(suit.state.turnSeatIndex, 1, 'turn advances after declaration');
+// --- K as final card never wins; auto-draws one ---
+state = makeState({ hand: [card('K', 'hearts')], topCard: card('9', 'hearts'), drawPile: [card('3', 'clubs')] });
+result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: 'K-hearts' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.success, true, 'final king plays');
+assert.equal(result.state.phase, 'PLAYING', 'no win declared');
+assert.equal(result.state.winnerSeatIndex, null, 'no winner');
+assert.equal(result.state.players[0].hand.length, 1, 'player obtained another card');
+assert.equal(result.state.carryOn, true, 'king still grants its extra play');
 
-// --- Draw / keep / end turn ---
-const keepState = initializeGame(players(2), DEFAULT_RULESET, fixedRandom);
-keepState.players[0].hand = [card('K', 'clubs')];
-keepState.drawPile = [card('3', 'diamonds')];
-keepState.discardPile = [card('7', 'hearts')];
-keepState.currentSuit = 'hearts';
-const drawn = applyAction(keepState, 0, { type: 'DRAW_CARD' }, DEFAULT_RULESET);
-assert.equal(drawn.success, true, 'draw succeeds');
-assert.equal(drawn.state.players[0].hand.length, 2, 'hand grows by one');
-assert.equal(drawn.state.hasDrawn, true, 'hasDrawn flag set');
-const secondDraw = applyAction(drawn.state, 0, { type: 'DRAW_CARD' }, DEFAULT_RULESET);
-assert.equal(secondDraw.success, false, 'second draw rejected');
-const ended = applyAction(drawn.state, 0, { type: 'END_TURN' }, DEFAULT_RULESET);
-assert.equal(ended.success, true, 'drawn card can be kept and turn ended');
-assert.equal(ended.state.players[0].hand.length, 2, 'kept card stays in hand');
-assert.equal(ended.state.turnSeatIndex, 1, 'turn passed');
+// --- 7 skips the next player in a three-player game ---
+state = makeState({
+  hand: [card('7', 'hearts'), card('5', 'clubs')], opponentHands: [[card('9', 'clubs')], [card('9', 'diamonds')]],
+  topCard: card('J', 'hearts'),
+});
+result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: '7-hearts' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.state.turnSeatIndex, 2, 'seven skips seat 1');
 
-// --- Reshuffle: top discard preserved, remainder recycled ---
-const reshuffleState = initializeGame(players(2), DEFAULT_RULESET, fixedRandom);
-reshuffleState.players[0].hand = [card('K', 'clubs')];
-reshuffleState.drawPile = [];
-reshuffleState.discardPile = [card('2', 'hearts'), card('3', 'spades'), card('4', 'diamonds')];
-reshuffleState.currentSuit = 'diamonds';
-const reshuffled = applyAction(reshuffleState, 0, { type: 'DRAW_CARD' }, DEFAULT_RULESET, fixedRandom);
-assert.equal(reshuffled.success, true, 'reshuffle draw succeeds');
-assert.deepEqual(reshuffled.state.discardPile, [card('4', 'diamonds')], 'top discard preserved');
-assert.equal(reshuffled.state.drawPile.length, 1, 'remainder reshuffled into draw pile');
-assert.equal(reshuffled.state.players[0].hand.length, 2, 'card drawn from recycled pile');
+// --- Jack reverses direction ---
+state = makeState({
+  hand: [card('J', 'hearts'), card('5', 'clubs')], opponentHands: [[card('9', 'clubs')], [card('9', 'diamonds')]],
+  topCard: card('J', 'clubs'),
+});
+result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: 'J-hearts' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.state.direction, -1, 'jack reverses direction');
 
-// --- Win ---
-const winState = initializeGame(players(2), DEFAULT_RULESET, fixedRandom);
-winState.players[0].hand = [card('K', 'hearts')];
-winState.discardPile = [card('5', 'hearts')];
-winState.currentSuit = 'hearts';
-const win = applyAction(winState, 0, { type: 'PLAY_CARD', cardId: 'K-hearts' }, DEFAULT_RULESET);
-assert.equal(win.success, true, 'last card playable');
-assert.equal(win.state.phase, 'FINISHED', 'game finished');
-assert.equal(win.state.winnerSeatIndex, 0, 'winner recorded');
-const afterWin = applyAction(win.state, 0, { type: 'DRAW_CARD' }, DEFAULT_RULESET);
-assert.equal(afterWin.success, false, 'actions rejected after finish');
+// --- 8 requires a suit declaration and cannot win alone ---
+state = makeState({ hand: [card('8', 'spades')], topCard: card('9', 'hearts'), drawPile: [card('3', 'clubs')] });
+result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: '8-spades' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.success, true, 'eight plays');
+assert.equal(result.state.phase, 'DECLARING_SUIT', 'eight asks for a suit');
+assert.equal(result.state.winnerSeatIndex, null, 'eight alone does not win');
+assert.equal(result.state.players[0].hand.length, 1, 'eight auto-drew another card');
 
-// --- AI behavior ---
-const aiState = initializeGame(players(2), DEFAULT_RULESET, fixedRandom);
-aiState.players[0].hand = [card('8', 'spades'), card('7', 'clubs'), card('K', 'hearts')];
-aiState.discardPile = [card('7', 'hearts')];
-aiState.currentSuit = 'hearts';
-assert.deepEqual(chooseAiAction(aiState, 0, DEFAULT_RULESET), { type: 'PLAY_CARD', cardId: 'K-hearts' }, 'AI prefers suit match');
-assert.equal(chooseAiSuit([card('A', 'spades'), card('3', 'spades'), card('5', 'hearts')]), 'spades', 'AI declares majority suit');
+// --- Reshuffle preserves the top discard ---
+state = makeState({
+  drawPile: [], discardPile: [card('2', 'hearts'), card('3', 'spades'), card('4', 'diamonds')],
+  hand: [card('K', 'clubs')],
+});
+result = applyAction(state, 0, { type: 'DRAW_CARD' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.success, true, 'draw after reshuffle succeeds');
+assert.deepEqual(result.state.discardPile, [card('4', 'diamonds')], 'top discard preserved');
+
+// --- Allowed finisher wins ---
+state = makeState({ hand: [card('9', 'hearts')], topCard: card('5', 'hearts') });
+result = applyAction(state, 0, { type: 'PLAY_CARD', cardId: '9-hearts' }, DEFAULT_RULESET, fixedRandom);
+assert.equal(result.state.phase, 'FINISHED', 'allowed finisher wins');
+assert.equal(result.state.winnerSeatIndex, 0, 'winner recorded');
+
+// --- AI pickup priority: Ace > Joker > 2 ---
+state = makeState({ pendingPickup: 5, hand: [card('2', 'diamonds'), joker(), card('A', 'spades')] });
+assert.deepEqual(chooseAiAction(state, 0, DEFAULT_RULESET), { type: 'PLAY_CARD', cardId: 'A-spades' }, 'AI blocks with an ace');
+state = makeState({ pendingPickup: 5, hand: [card('2', 'diamonds'), joker()] });
+assert.deepEqual(chooseAiAction(state, 0, DEFAULT_RULESET), { type: 'PLAY_CARD', cardId: 'JOKER-jokers' }, 'AI prefers joker over two');
+state = makeState({ pendingPickup: 5, hand: [card('9', 'clubs'), card('2', 'diamonds')] });
+assert.deepEqual(chooseAiAction(state, 0, DEFAULT_RULESET), { type: 'PLAY_CARD', cardId: '2-diamonds' }, 'AI plays a two');
+state = makeState({ pendingPickup: 5, hand: [card('9', 'clubs')] });
+assert.deepEqual(chooseAiAction(state, 0, DEFAULT_RULESET), { type: 'RESOLVE_PICKUP' }, 'AI picks up when it cannot respond');
+
+// --- AI avoids ending on a prohibited card ---
+state = makeState({ hand: [card('K', 'hearts')], currentSuit: 'hearts', topCard: top });
+assert.deepEqual(chooseAiAction(state, 0, DEFAULT_RULESET), { type: 'DRAW_CARD' }, 'AI draws instead of stroking a lone king');
+
+// --- Full AI game terminates ---
+state = initializeGame(players(4).map(p => ({ ...p, isAI: true })), DEFAULT_RULESET, Math.random);
+let guard = 0;
+while (state.phase === 'PLAYING' && guard < 500) {
+  guard += 1;
+  const actor = state.players.find(p => p.seatIndex === state.turnSeatIndex);
+  const res = applyAction(state, actor.seatIndex, chooseAiAction(state, actor.seatIndex, DEFAULT_RULESET), DEFAULT_RULESET, Math.random);
+  assert.equal(res.success, true, 'AI action succeeds');
+  state = res.state;
+  if (state.phase === 'DECLARING_SUIT') {
+    const pending = state.players.find(p => p.seatIndex === state.turnSeatIndex);
+    const declared = applyAction(state, pending.seatIndex, { type: 'DECLARE_SUIT', suit: chooseAiSuit(pending.hand) }, DEFAULT_RULESET, Math.random);
+    assert.equal(declared.success, true, 'suit declaration succeeds');
+    state = declared.state;
+  }
+}
+assert.equal(state.phase, 'FINISHED', 'AI game completes');
+assert.ok(guard < 500, 'AI game terminates within the guard');
 
 console.log('Engine tests passed.');

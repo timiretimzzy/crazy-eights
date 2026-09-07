@@ -1,8 +1,14 @@
 export const SUITS = ['hearts', 'diamonds', 'clubs', 'spades'] as const;
-export type Suit = (typeof SUITS)[number];
+export type StandardSuit = (typeof SUITS)[number];
 
-export const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'] as const;
+export const JOKER_SUIT = 'jokers';
+export type JokerSuit = typeof JOKER_SUIT;
+
+export const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'JOKER'] as const;
 export type Rank = (typeof RANKS)[number];
+
+export type Suit = StandardSuit | JokerSuit;
+export type DeclareSuit = StandardSuit;
 
 export type Card = {
   id: string;
@@ -11,32 +17,40 @@ export type Card = {
 };
 
 export type Ruleset = {
+  jokerEnabled: boolean;
+  jokerPickup: number;
+  aceBlocksPickup: boolean;
+  twoPickup: number;
+  sevenAction: 'skip' | 'reverse';
+  jackAction: 'skip' | 'reverse';
   eightsWild: boolean;
+  kingCarryOn: boolean;
+  mixedPickupStacking: boolean;
+  restrictedFirstCards: boolean;
+  restrictedWinningCards: boolean;
   dealRules: {
     smallGameMaxPlayers: number;
     smallGameCards: number;
     largeGameCards: number;
   };
-  houseRules: {
-    twosDrawTwo: boolean;
-    queensSkip: boolean;
-    jacksReverse: boolean;
-    aces: 'draw_4' | 'skip' | 'off';
-  };
 };
 
 export const DEFAULT_RULESET: Ruleset = {
+  jokerEnabled: true,
+  jokerPickup: 5,
+  aceBlocksPickup: true,
+  twoPickup: 2,
+  sevenAction: 'skip',
+  jackAction: 'reverse',
   eightsWild: true,
+  kingCarryOn: true,
+  mixedPickupStacking: true,
+  restrictedFirstCards: true,
+  restrictedWinningCards: true,
   dealRules: {
     smallGameMaxPlayers: 3,
     smallGameCards: 5,
     largeGameCards: 4,
-  },
-  houseRules: {
-    twosDrawTwo: false,
-    queensSkip: false,
-    jacksReverse: false,
-    aces: 'off',
   },
 };
 
@@ -56,10 +70,16 @@ export type GameState = {
   players: Player[];
   drawPile: Card[];
   discardPile: Card[];
-  currentSuit: Suit | null;
+  currentSuit: DeclareSuit | null;
   turnSeatIndex: number;
   direction: 1 | -1;
   hasDrawn: boolean;
+  /** True while the current player holds one unconsumed extra play opportunity
+   * granted by the immediately preceding King (or an Ace pickup block). It is
+   * consumed by the very next play; a King re-grants it. It is NOT a persistent
+   * "keep playing" state — advanceTurn clears it. */
+  carryOn: boolean;
+  pendingPickup: number;
   pendingEightCardId: string | null;
   winnerSeatIndex: number | null;
   version: number;
@@ -67,9 +87,10 @@ export type GameState = {
 
 export type GameAction =
   | { type: 'PLAY_CARD'; cardId: string }
-  | { type: 'DECLARE_SUIT'; suit: Suit }
+  | { type: 'DECLARE_SUIT'; suit: DeclareSuit }
   | { type: 'DRAW_CARD' }
-  | { type: 'END_TURN' };
+  | { type: 'END_TURN' }
+  | { type: 'RESOLVE_PICKUP' };
 
 export type GameEvent = {
   type:
@@ -78,7 +99,15 @@ export type GameEvent = {
     | 'SUIT_DECLARED'
     | 'TURN_CHANGED'
     | 'PLAYER_WON'
-    | 'GAME_STARTED';
+    | 'GAME_STARTED'
+    | 'SKIPPED'
+    | 'REVERSED'
+    | 'PICKUP_ADDED'
+    | 'PICKUP_BLOCKED'
+    | 'PICKUP_RESOLVED'
+    | 'CARRY_ON'
+    | 'AUTO_DREW'
+    | 'GAME_STALLED';
   seatIndex?: number;
   payload?: Record<string, unknown>;
 };

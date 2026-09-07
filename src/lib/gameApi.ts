@@ -1,5 +1,5 @@
 import { supabase } from './supabase.ts';
-import type { GameAction, GameState, Ruleset, Suit } from '../engine/types.ts';
+import type { DeclareSuit, GameAction, GameState, Ruleset } from '../engine/types.ts';
 
 export type PublicPlayer = {
   seatIndex: number;
@@ -18,10 +18,12 @@ export type PublicGameState = {
   players: PublicPlayer[];
   turnSeatIndex: number | null;
   topDiscard: { id: string; rank: string; suit: string } | null;
-  currentSuit: Suit | null;
+  currentSuit: DeclareSuit | null;
   drawCount: number;
   direction: 1 | -1;
   hasDrawn: boolean;
+  pendingPickup: number;
+  carryOn: boolean;
   winnerSeatIndex: number | null;
   version: number;
   ruleset: Ruleset;

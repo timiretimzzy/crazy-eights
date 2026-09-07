@@ -1,7 +1,9 @@
-import { cardsPerPlayer, canDraw, isPlayable } from './rules.ts';
+import { cardsPerPlayer, canDraw, hasPickupResponse, isPlayable, isStarterRank, isWinningRank } from './rules.ts';
 import { createDeck, shuffle } from './deck.ts';
-import { advanceTurn } from './turn.ts';
-import type { ActionResult, Card, GameAction, GameEvent, GameState, Player, Ruleset, Suit } from './types.ts';
+import { advanceTurn, reverseTurn, skipNextPlayer } from './turn.ts';
+import type { ActionResult, Card, DeclareSuit, GameAction, GameEvent, GameState, Player, Ruleset } from './types.ts';
+
+const AUTO_RESOLVE_GUARD = 64;
 
 function cloneState(state: GameState): GameState {
   return structuredClone(state);
@@ -24,6 +26,46 @@ function drawOne(state: GameState, random: () => number): Card | null {
   return state.drawPile.pop() ?? null;
 }
 
+function drawN(state: GameState, count: number, random: () => number): Card[] {
+  const drawn: Card[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const card = drawOne(state, random);
+    if (!card) break;
+    drawn.push(card);
+  }
+  return drawn;
+}
+
+function currentActor(state: GameState): Player | undefined {
+  return state.players.find((player) => player.seatIndex === state.turnSeatIndex);
+}
+
+/**
+ * Automatic pickup at turn advancement. When the player facing a pending
+ * pickup has response cards (Ace/Joker/2) they are left to act; otherwise the
+ * accumulated penalty is drawn automatically, the pickup is cleared, and the
+ * turn advances again. Bounded so chains can never loop forever.
+ */
+function resolveAutoPickups(state: GameState, ruleset: Ruleset, random: () => number, events: GameEvent[]): void {
+  let guard = 0;
+  while (state.phase === 'PLAYING' && state.pendingPickup > 0 && guard < AUTO_RESOLVE_GUARD) {
+    guard += 1;
+    const victim = currentActor(state);
+    if (!victim) return;
+    if (hasPickupResponse(victim.hand, ruleset)) return;
+    const requested = state.pendingPickup;
+    const drawn = drawN(state, requested, random);
+    state.pendingPickup = 0;
+    if (drawn.length > 0) {
+      victim.hand.push(...drawn);
+      events.push({ type: 'CARD_DRAWN', seatIndex: victim.seatIndex, payload: { count: drawn.length, cardIds: drawn.map((c) => c.id) } });
+    }
+    events.push({ type: 'PICKUP_RESOLVED', seatIndex: victim.seatIndex, payload: { requested, count: drawn.length } });
+    advanceTurn(state);
+    events.push({ type: 'TURN_CHANGED', seatIndex: state.turnSeatIndex });
+  }
+}
+
 export function initializeGame(
   players: Player[],
   ruleset: Ruleset,
@@ -42,20 +84,28 @@ export function initializeGame(
   }
 
   let startingDiscard: Card | undefined;
-  do {
-    startingDiscard = deck.pop();
-    if (!startingDiscard) throw new Error('Deck exhausted while choosing starting discard');
-  } while (startingDiscard.rank === '8');
+  const rejected: Card[] = [];
+  while (!startingDiscard) {
+    const candidate = deck.pop();
+    if (!candidate) throw new Error('Deck exhausted while choosing starting discard');
+    if (ruleset.restrictedFirstCards && !isStarterRank(candidate.rank)) {
+      rejected.push(candidate);
+      continue;
+    }
+    startingDiscard = candidate;
+  }
 
   return {
     phase: 'PLAYING',
     players: hands,
-    drawPile: deck,
+    drawPile: [...deck, ...rejected],
     discardPile: [startingDiscard],
-    currentSuit: startingDiscard.suit,
+    currentSuit: startingDiscard.suit as DeclareSuit,
     turnSeatIndex: hands[0].seatIndex,
     direction: 1,
     hasDrawn: false,
+    carryOn: false,
+    pendingPickup: 0,
     pendingEightCardId: null,
     winnerSeatIndex: null,
     version: 1,
@@ -100,6 +150,26 @@ export function applyAction(
 
   if (state.phase !== 'PLAYING') return error('SUIT_REQUIRED', 'Choose a suit before continuing.');
 
+  if (state.pendingPickup > 0 && action.type !== 'PLAY_CARD' && action.type !== 'RESOLVE_PICKUP') {
+    return error('PICKUP_PENDING', 'Respond with an Ace, 2, or Joker, or pick up the cards.');
+  }
+
+  if (action.type === 'RESOLVE_PICKUP') {
+    if (state.pendingPickup <= 0) return error('NO_PICKUP', 'There is no pickup to resolve.');
+    const requested = state.pendingPickup;
+    const drawn = drawN(state, requested, random);
+    state.pendingPickup = 0;
+    if (drawn.length > 0) {
+      actor.hand.push(...drawn);
+      events.push({ type: 'CARD_DRAWN', seatIndex: actorSeatIndex, payload: { count: drawn.length, cardIds: drawn.map((c) => c.id) } });
+    }
+    events.push({ type: 'PICKUP_RESOLVED', seatIndex: actorSeatIndex, payload: { requested, count: drawn.length } });
+    advanceTurn(state);
+    state.version += 1;
+    events.push({ type: 'TURN_CHANGED', seatIndex: state.turnSeatIndex });
+    return { success: true, state, events };
+  }
+
   if (action.type === 'DRAW_CARD') {
     if (!canDraw(state.hasDrawn)) return error('ALREADY_DREW', 'You may only draw once per turn.');
     const card = drawOne(state, random);
@@ -107,7 +177,7 @@ export function applyAction(
     actor.hand.push(card);
     state.hasDrawn = true;
     state.version += 1;
-    events.push({ type: 'CARD_DRAWN', seatIndex: actorSeatIndex, payload: { cardId: card.id, card } });
+    events.push({ type: 'CARD_DRAWN', seatIndex: actorSeatIndex, payload: { cardId: card.id, card, count: 1 } });
     return { success: true, state, events };
   }
 
@@ -122,31 +192,124 @@ export function applyAction(
   const cardIndex = actor.hand.findIndex((card) => card.id === action.cardId);
   if (cardIndex < 0) return error('CARD_NOT_OWNED', 'You do not have that card.');
   const card = actor.hand[cardIndex];
-  if (!isPlayable(card, topCard, state.currentSuit, ruleset)) {
-    return error('INVALID_PLAY', 'That card does not match the current suit or rank.');
+  if (!isPlayable(card, topCard, state.currentSuit, ruleset, { pendingPickup: state.pendingPickup })) {
+    return error('INVALID_PLAY', 'That card is not playable right now.');
   }
 
   actor.hand.splice(cardIndex, 1);
   state.discardPile.push(card);
   state.hasDrawn = false;
-  state.version += 1;
+  // Any outstanding extra play opportunity (from a King or Ace block) is
+  // consumed by this play. A King re-grants it below; everything else does not.
+  state.carryOn = false;
   events.push({ type: 'CARD_PLAYED', seatIndex: actorSeatIndex, payload: { cardId: card.id, card } });
+  const cardRank = card.rank;
 
   if (actor.hand.length === 0) {
-    state.phase = 'FINISHED';
-    state.winnerSeatIndex = actorSeatIndex;
-    events.push({ type: 'PLAYER_WON', seatIndex: actorSeatIndex });
-    return { success: true, state, events };
+    if (ruleset.restrictedWinningCards && !isWinningRank(cardRank)) {
+      // Prohibited winning card: never declare victory. Obtain another card,
+      // or end the game in a controlled stop if nothing can be drawn.
+      const drawn = drawOne(state, random);
+      if (drawn) {
+        actor.hand.push(drawn);
+        events.push({ type: 'AUTO_DREW', seatIndex: actorSeatIndex, payload: { cardId: drawn.id, card: drawn } });
+      } else {
+        state.phase = 'FINISHED';
+        state.winnerSeatIndex = null;
+        events.push({ type: 'GAME_STALLED', seatIndex: actorSeatIndex });
+        state.version += 1;
+        return { success: true, state, events };
+      }
+    } else {
+      state.phase = 'FINISHED';
+      state.winnerSeatIndex = actorSeatIndex;
+      events.push({ type: 'PLAYER_WON', seatIndex: actorSeatIndex });
+      state.version += 1;
+      return { success: true, state, events };
+    }
   }
 
-  if (ruleset.eightsWild && card.rank === '8') {
+  if (ruleset.eightsWild && cardRank === '8') {
     state.phase = 'DECLARING_SUIT';
     state.pendingEightCardId = card.id;
     state.currentSuit = null;
+    state.version += 1;
     return { success: true, state, events };
   }
 
-  state.currentSuit = card.suit;
+  if (cardRank === 'JOKER' && ruleset.jokerEnabled) {
+    state.pendingPickup += ruleset.jokerPickup;
+    events.push({ type: 'PICKUP_ADDED', seatIndex: actorSeatIndex, payload: { amount: ruleset.jokerPickup, total: state.pendingPickup } });
+    // A Joker keeps the current active suit live.
+    state.version += 1;
+    advanceTurn(state);
+    events.push({ type: 'TURN_CHANGED', seatIndex: state.turnSeatIndex });
+    resolveAutoPickups(state, ruleset, random, events);
+    return { success: true, state, events };
+  }
+
+  if (cardRank === '2') {
+    state.pendingPickup += ruleset.twoPickup;
+    events.push({ type: 'PICKUP_ADDED', seatIndex: actorSeatIndex, payload: { amount: ruleset.twoPickup, total: state.pendingPickup } });
+    state.currentSuit = card.suit as DeclareSuit;
+    state.version += 1;
+    advanceTurn(state);
+    events.push({ type: 'TURN_CHANGED', seatIndex: state.turnSeatIndex });
+    resolveAutoPickups(state, ruleset, random, events);
+    return { success: true, state, events };
+  }
+
+  if (cardRank === 'A' && state.pendingPickup > 0 && ruleset.aceBlocksPickup) {
+    state.pendingPickup = 0;
+    state.carryOn = true;
+    state.currentSuit = card.suit as DeclareSuit;
+    events.push({ type: 'PICKUP_BLOCKED', seatIndex: actorSeatIndex });
+    events.push({ type: 'CARRY_ON', seatIndex: actorSeatIndex });
+    state.version += 1;
+    return { success: true, state, events };
+  }
+
+  if (cardRank === '7') {
+    if (ruleset.sevenAction === 'reverse') {
+      events.push({ type: 'REVERSED', seatIndex: actorSeatIndex });
+      reverseTurn(state);
+    } else {
+      events.push({ type: 'SKIPPED', seatIndex: actorSeatIndex });
+      skipNextPlayer(state);
+    }
+    state.currentSuit = card.suit as DeclareSuit;
+    state.version += 1;
+    events.push({ type: 'TURN_CHANGED', seatIndex: state.turnSeatIndex });
+    return { success: true, state, events };
+  }
+
+  if (cardRank === 'J') {
+    if (ruleset.jackAction === 'reverse') {
+      events.push({ type: 'REVERSED', seatIndex: actorSeatIndex });
+      reverseTurn(state);
+    } else {
+      events.push({ type: 'SKIPPED', seatIndex: actorSeatIndex });
+      skipNextPlayer(state);
+    }
+    state.currentSuit = card.suit as DeclareSuit;
+    state.version += 1;
+    events.push({ type: 'TURN_CHANGED', seatIndex: state.turnSeatIndex });
+    return { success: true, state, events };
+  }
+
+  if (cardRank === 'K' && ruleset.kingCarryOn) {
+    // Authoritative King rule: the same player receives exactly ONE additional
+    // play opportunity. It is consumed by the next play; a subsequent King
+    // re-grants it. This is not a persistent keep-playing state.
+    state.carryOn = true;
+    state.currentSuit = card.suit as DeclareSuit;
+    events.push({ type: 'CARRY_ON', seatIndex: actorSeatIndex });
+    state.version += 1;
+    return { success: true, state, events };
+  }
+
+  state.currentSuit = card.suit as DeclareSuit;
+  state.version += 1;
   advanceTurn(state);
   events.push({ type: 'TURN_CHANGED', seatIndex: state.turnSeatIndex });
   return { success: true, state, events };

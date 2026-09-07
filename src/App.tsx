@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ChangeEvent, CSSProperties, ReactNode } from 'react';
-import type { Card, GameAction, GameState, Ruleset, Suit } from './engine/types.ts';
+import type { Card, DeclareSuit, GameAction, GameState, Ruleset, Suit } from './engine/types.ts';
 import { DEFAULT_RULESET, SUITS } from './engine/types.ts';
 import { applyAction, initializeGame } from './engine/reducer.ts';
 import { chooseAiAction, chooseAiSuit } from './engine/ai.ts';
@@ -18,7 +18,7 @@ import {
   type PublicGameState,
 } from './lib/gameApi.ts';
 
-const SUIT_NAME: Record<Suit, string> = { hearts: 'Hearts', diamonds: 'Diamonds', clubs: 'Clubs', spades: 'Spades' };
+const SUIT_NAME: Record<Suit, string> = { hearts: 'Hearts', diamonds: 'Diamonds', clubs: 'Clubs', spades: 'Spades', jokers: 'Jokers' };
 
 type Screen = 'home' | 'soloSetup' | 'createLobby' | 'join' | 'lobby' | 'game' | 'results';
 
@@ -103,12 +103,12 @@ export function App() {
     finally { setBusy(false); }
   };
 
-  const handleCreateLobby = async (maxSeats: number) => {
+  const handleCreateLobby = async (maxSeats: number, ruleset: Ruleset) => {
     if (!supabaseConfigured) { setErrorMessage('Configure Supabase to create online friend games.'); return; }
     setBusy(true); setErrorMessage('');
     try {
       await ensureAnonymousSession();
-      const created = await createLobby(mode, maxSeats, displayName.trim() || 'Player');
+      const created = await createLobby(mode, maxSeats, displayName.trim() || 'Player', ruleset);
       navigateGame(created.gameId);
       await loadGame(created.gameId);
     } catch (error) { setErrorMessage(error instanceof Error ? error.message : 'Could not create lobby.'); }
@@ -157,7 +157,7 @@ function Home({ displayName, setDisplayName, setScreen }: { displayName: string;
 }
 
 function RulesModal({ onClose }: { onClose: () => void }) {
-  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="How to play"><div className="suit-modal rules-modal"><span className="eyebrow">THE TABLE RULES</span><h3>Crazy Eights</h3><ol className="rule-list"><li>Match the suit or rank of the top discard, or draw a card.</li><li>Play an <b>8</b> any time to change the active suit.</li><li>Clear your hand first to take the table.</li></ol><button className="primary" onClick={onClose}>Back to the room</button></div></div>;
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="How to play"><div className="suit-modal rules-modal"><span className="eyebrow">THE TABLE RULES</span><h3>Crazy Eights</h3><ol className="rule-list"><li>Match the suit or rank of the top discard, or draw a card.</li><li>Play an <b>8</b> any time to change the active suit — then name a new suit.</li><li><b>Jokers</b> are wild and force the next player to <b>pick up 5</b>.</li><li>A <b>2</b> adds 2 to a pickup; an <b>Ace</b> blocks the whole pile and grants an extra play; a <b>King</b> lets you play exactly once more.</li><li>A <b>7</b> skips the next player; a <b>Jack</b> reverses the table (swap-able in house rules).</li><li>Only <b>3–6, 9, 10, Q</b> may start or finish a hand by default.</li><li>Clear your hand first to take the table.</li></ol><button className="primary" onClick={onClose}>Back to the room</button></div></div>;
 }
 
 function JoinGame({ gameId, displayName, setDisplayName, onJoin, busy, back }: { gameId: string; displayName: string; setDisplayName: (v: string) => void; onJoin: () => Promise<void>; busy: boolean; back: () => void }) {
@@ -170,8 +170,23 @@ function JoinGame({ gameId, displayName, setDisplayName, onJoin, busy, back }: {
   </section>;
 }
 
+function HouseRules({ ruleset, onChange }: { ruleset: Ruleset; onChange: (r: Ruleset) => void }) {
+  const flag = (key: 'jokerEnabled' | 'aceBlocksPickup' | 'kingCarryOn', label: string) => (
+    <label className="rule-toggle"><input type="checkbox" checked={ruleset[key]} onChange={e => onChange({ ...ruleset, [key]: e.target.checked })} /><span>{label}</span></label>
+  );
+  const restricted = ruleset.restrictedFirstCards && ruleset.restrictedWinningCards;
+  return <div className="rules-panel"><details className="rules-accordion"><summary>House rules</summary><div className="rules-grid">
+    {flag('jokerEnabled', 'Jokers in the deck (+5 pickup)')}
+    {flag('aceBlocksPickup', 'Aces block pickups')}
+    {flag('kingCarryOn', 'Kings let you play again')}
+    <label className="rule-toggle"><input type="checkbox" checked={ruleset.sevenAction === 'skip'} onChange={e => onChange({ ...ruleset, sevenAction: e.target.checked ? 'skip' : 'reverse', jackAction: e.target.checked ? 'reverse' : 'skip' })} /><span>7 skips · Jack reverses</span></label>
+    <label className="rule-toggle"><input type="checkbox" checked={restricted} onChange={e => onChange({ ...ruleset, restrictedFirstCards: e.target.checked, restrictedWinningCards: e.target.checked })} /><span>Restricted start &amp; win cards (3–6, 9, 10, Q)</span></label>
+  </div><p className="helper small">Defaults: Jokers +5, Ace block, King extra play, restricted starts &amp; wins.</p></details></div>;
+}
+
 function SoloSetup({ onStart, busy, back }: { onStart: (n: number, ruleset: Ruleset) => Promise<void>; busy: boolean; back: () => void }) {
   const [opponents, setOpponents] = useState(3);
+  const [ruleset, setRuleset] = useState<Ruleset>(DEFAULT_RULESET);
   return <section className="screen setup-panel screen-enter">
     <button className="back" onClick={back}>← Back</button>
     <span className="eyebrow">PRIVATE GAME</span><h2 className="display">Pick your<br /><span>opponents.</span></h2>
@@ -179,19 +194,22 @@ function SoloSetup({ onStart, busy, back }: { onStart: (n: number, ruleset: Rule
     <div className="mini-table">
       {Array.from({ length: opponents + 1 }, (_, i) => <span key={i} className={`seat-chip ${i === 0 ? 'me' : ''}`}>{i === 0 ? 'YOU' : <><i className="bot" />BOT {i}</>}</span>).reverse()}
     </div>
-    <button className="primary huge" disabled={busy} onClick={() => void onStart(opponents, DEFAULT_RULESET)}>{busy ? 'Dealing…' : 'Deal the cards'} <span className="btn-arrow">→</span></button>
+    <HouseRules ruleset={ruleset} onChange={setRuleset} />
+    <button className="primary huge" disabled={busy} onClick={() => void onStart(opponents, ruleset)}>{busy ? 'Dealing…' : 'Deal the cards'} <span className="btn-arrow">→</span></button>
   </section>;
 }
 
-function CreateLobby({ mode, setMode, onCreate, busy, back }: { mode: 'mixed' | 'humans_only'; setMode: (v: 'mixed' | 'humans_only') => void; onCreate: (n: number) => Promise<void>; busy: boolean; back: () => void }) {
+function CreateLobby({ mode, setMode, onCreate, busy, back }: { mode: 'mixed' | 'humans_only'; setMode: (v: 'mixed' | 'humans_only') => void; onCreate: (n: number, ruleset: Ruleset) => Promise<void>; busy: boolean; back: () => void }) {
   const [seats, setSeats] = useState(4);
+  const [ruleset, setRuleset] = useState<Ruleset>(DEFAULT_RULESET);
   return <section className="screen setup-panel screen-enter">
     <button className="back" onClick={back}>← Back</button>
     <span className="eyebrow">PRIVATE ROOM</span><h2 className="display">Build your<br /><span>table.</span></h2>
     <div className="segmented"><button className={mode === 'mixed' ? 'active' : ''} onClick={() => setMode('mixed')}>Mixed</button><button className={mode === 'humans_only' ? 'active' : ''} onClick={() => setMode('humans_only')}>Humans only</button></div>
     <label className="range-field"><span>GUESTS</span><div className="range-row"><input type="range" min="2" max="6" value={seats} onChange={(e: ChangeEvent<HTMLInputElement>) => setSeats(Number(e.target.value))} /><strong>{seats}</strong></div></label>
     <p className="helper">{mode === 'mixed' ? 'The dealer fills empty seats with bots when the game starts.' : 'The table shrinks to exactly the guests who show up.'}</p>
-    <button className="primary huge" disabled={busy} onClick={() => void onCreate(seats)}>{busy ? 'Opening…' : 'Open the table'} <span className="btn-arrow">→</span></button>
+    <HouseRules ruleset={ruleset} onChange={setRuleset} />
+    <button className="primary huge" disabled={busy} onClick={() => void onCreate(seats, ruleset)}>{busy ? 'Opening…' : 'Open the table'} <span className="btn-arrow">→</span></button>
   </section>;
 }
 
@@ -231,6 +249,8 @@ function GameView({ snapshot, gameId, localState, onLocalState, onSnapshot, onFi
   const localMode = gameId === 'local';
   const myTurn = snapshot.publicState.turnSeatIndex === snapshot.publicState.mySeatIndex;
   const topDiscard = snapshot.publicState.topDiscard as Card | null;
+  const pickupActive = snapshot.publicState.pendingPickup > 0;
+  const pickupN = snapshot.publicState.pendingPickup;
 
   useEffect(() => { if (snapshot.publicState.status === 'finished') onFinish(); }, [snapshot.publicState.status, onFinish]);
   useEffect(() => { if (snapshot.phase === 'DECLARING_SUIT') setSuitOpen(true); }, [snapshot.phase]);
@@ -355,30 +375,32 @@ function GameView({ snapshot, gameId, localState, onLocalState, onSnapshot, onFi
     </div>
     <div className="spotlight-layer" aria-hidden="true">{activeSeat >= 0 && <div className={`seat-spot ${activeIsMe ? 'me' : ''}`} style={{ left: `${spots[activeSeat].left}%`, top: `${spots[activeSeat].top}%` }} />}</div>
     <div className="center-table">
-      <button ref={deckRef} className="deck-stack" disabled={!myTurn || loading || dealing || snapshot.publicState.hasDrawn} onClick={() => { void act({ type: 'DRAW_CARD' }); }} aria-label="Draw a card">
+      <button ref={deckRef} className="deck-stack" disabled={!myTurn || loading || dealing || snapshot.publicState.hasDrawn || pickupActive} onClick={() => { void act({ type: 'DRAW_CARD' }); }} aria-label="Draw a card">
         <span className="card-back"><svg viewBox="0 0 60 88" className="back-art"><rect x="5.5" y="5.5" width="49" height="77" rx="7" className="back-frame" /><rect x="10" y="10" width="40" height="68" rx="5" className="back-inner" /><path d="M30 26 L42 44 L30 62 L18 44 Z" className="back-emblem" /><path d="M30 49 L37 60 L30 71 L23 60 Z" className="back-emblem-s" /></svg></span>
-        <small>{snapshot.publicState.hasDrawn ? 'DRAWN' : 'DRAW'}</small><em>{snapshot.publicState.drawCount}</em>
+        <small>{snapshot.publicState.hasDrawn ? 'DRAWN' : (pickupActive ? '' : 'DRAW')}</small><em>{snapshot.publicState.drawCount}</em>
       </button>
       <div className="table-hud-sep" />
       <div ref={discardRef} className="discard-slot">{topDiscard ? <CardFace key={topDiscard.id} card={topDiscard} /> : <div className="empty-pile" />}</div>
       {snapshot.publicState.currentSuit && <div className="active-suit"><span>ACTIVE</span><strong><SuitIcon suit={snapshot.publicState.currentSuit} /> {SUIT_NAME[snapshot.publicState.currentSuit]}</strong></div>}
     </div>
     <div className="hud-top"><div><span className="eyebrow">TABLE {tableCode(snapshot.publicState.gameId)}</span><div className={`turn-copy ${myTurn ? 'active' : ''}`}>{myTurn ? 'YOUR TURN' : turnCopy(snapshot)}</div></div>{myTurn && <div className="your-turn-badge">YOUR TURN</div>}</div>
+    {pickupActive && <div className="pickup-banner"><span className="eyebrow">THE TABLE DEMANDS</span><strong>PICK UP <b>{pickupN}</b></strong><button className="primary" disabled={loading || !myTurn} onClick={() => void act({ type: 'RESOLVE_PICKUP' })}>Pick up {pickupN}</button><small>Ace, 2, or Joker answers the call…</small></div>}
+    {!pickupActive && myTurn && snapshot.publicState.carryOn && <div className="carry-banner"><span className="eyebrow">KING’S ORDERS</span><strong>CARRY ON</strong><small>You may play again.</small></div>}
     <div className="hand-area">
       <div className="hand-label"><span>Your hand</span><span>{snapshot.myHand.length} cards</span></div>
       <div ref={handRef} className="hand">
-        {snapshot.myHand.map((card, i) => {
-          const playable = topDiscard ? isPlayable(card, topDiscard, snapshot.publicState.currentSuit, snapshot.publicState.ruleset) : false;
+{snapshot.myHand.map((card, i) => {
+          const playable = topDiscard ? isPlayable(card, topDiscard, snapshot.publicState.currentSuit, snapshot.publicState.ruleset, { pendingPickup: snapshot.publicState.pendingPickup }) : false;
           const sel = selectedId === card.id;
-          return <button key={card.id} className={`hand-card ${myTurn && playable ? 'playable-hint' : 'not-playable'} ${sel ? 'is-selected' : ''}`} style={{ '--i': i, '--n': snapshot.myHand.length } as CSSProperties} disabled={!myTurn || loading || dealing} aria-pressed={sel} aria-label={`${card.rank} of ${card.suit}`} onClick={e => playCard(card, e.currentTarget)}><CardFace card={card} /></button>;
+          return <button key={card.id} className={`hand-card ${myTurn && playable ? 'playable-hint' : 'not-playable'} ${pickupActive && playable ? 'pickup-responder' : ''} ${sel ? 'is-selected' : ''}`} style={{ '--i': i, '--n': snapshot.myHand.length } as CSSProperties} disabled={!myTurn || loading || dealing} aria-pressed={sel} aria-label={`${card.rank} of ${card.suit}`} onClick={e => playCard(card, e.currentTarget)}><CardFace card={card} /></button>;
         })}
       </div>
       <div className="hand-actions">
         {selectedId && myTurn && <button className="primary play-btn" disabled={loading} onClick={() => { const c = snapshot.myHand.find(x => x.id === selectedId); if (c) playCard(c); }}><span className="btn-arrow">▶</span>Play card</button>}
-        {myTurn && !selectedId && snapshot.publicState.hasDrawn && <button className="secondary end-turn" disabled={loading || dealing} onClick={() => void act({ type: 'END_TURN' })}>Keep card · End turn</button>}
+        {myTurn && !pickupActive && !selectedId && snapshot.publicState.hasDrawn && <button className="secondary end-turn" disabled={loading || dealing} onClick={() => void act({ type: 'END_TURN' })}>Keep card · End turn</button>}
       </div>
-      {myTurn && <div className="turn-help">{selectedId ? 'Your card is raised. Tap it again or press Play.' : snapshot.publicState.hasDrawn ? 'Play the drawn card, or keep it and end your turn.' : 'Tap a matching card to raise it, or draw from the deck.'}</div>}
-      {localMode && myTurn && !selectedId && !snapshot.publicState.hasDrawn && !snapshot.myHand.some(c => topDiscard != null && isPlayable(c, topDiscard, snapshot.publicState.currentSuit, snapshot.publicState.ruleset)) && <button className="secondary end-turn" disabled={loading || dealing} onClick={() => void act({ type: 'DRAW_CARD' })}>Draw a card</button>}
+      {myTurn && <div className="turn-help">{pickupActive ? `The table demands ${pickupN}. Match with an Ace, a 2, or a Joker, or pick them up.` : selectedId ? 'Your card is raised. Tap it again or press Play.' : snapshot.publicState.hasDrawn ? 'Play the drawn card, or keep it and end your turn.' : snapshot.publicState.carryOn ? 'Carry on: play again after that King.' : 'Tap a matching card to raise it, or draw from the deck.'}</div>}
+      {localMode && myTurn && !pickupActive && !selectedId && !snapshot.publicState.hasDrawn && !snapshot.myHand.some(c => topDiscard != null && isPlayable(c, topDiscard, snapshot.publicState.currentSuit, snapshot.publicState.ruleset, { pendingPickup: snapshot.publicState.pendingPickup })) && <button className="secondary end-turn" disabled={loading || dealing} onClick={() => void act({ type: 'DRAW_CARD' })}>Draw a card</button>}
     </div>
     {dealing && dealCards.length > 0 && <div className="deal-fx" aria-hidden="true">{dealCards.map(d => <span key={d.key} className="deal-card" style={{ '--dx': `${d.x0 - window.innerWidth / 2}px`, '--dy': `${d.y0 - window.innerHeight * 0.42}px`, '--delay': `${d.delay}ms` } as CSSProperties}><span className="card-back small"><svg viewBox="0 0 60 88" className="back-art"><rect x="5.5" y="5.5" width="49" height="77" rx="7" className="back-frame" /><rect x="10" y="10" width="40" height="68" rx="5" className="back-inner" /><path d="M30 26 L42 44 L30 62 L18 44 Z" className="back-emblem" /><path d="M30 49 L37 60 L30 71 L23 60 Z" className="back-emblem-s" /></svg></span></span>)}</div>}
     {flights.length > 0 && <div className="fly-fx" aria-hidden="true">{flights.map(f => <span key={f.key} className={`fly-card ${f.faceUp ? 'face-up' : 'back'}`} style={{ '--fx': `${f.from.x}px`, '--fy': `${f.from.y}px`, '--tx': `${f.to.x}px`, '--ty': `${f.to.y}px`, '--dur': `${f.duration}ms` } as CSSProperties}>{f.faceUp && f.card ? <CardFace card={f.card} /> : <span className="card-back small"><svg viewBox="0 0 60 88" className="back-art"><rect x="5.5" y="5.5" width="49" height="77" rx="7" className="back-frame" /><rect x="10" y="10" width="40" height="68" rx="5" className="back-inner" /><path d="M30 26 L42 44 L30 62 L18 44 Z" className="back-emblem" /><path d="M30 49 L37 60 L30 71 L23 60 Z" className="back-emblem-s" /></svg></span>}</span>)}</div>}
@@ -416,6 +438,9 @@ type DealCard = { key: string; kind: 'hand' | 'seat' | 'discard'; x0: number; y0
 type Flight = { key: string; faceUp: boolean; card: Card | null; from: { x: number; y: number }; to: { x: number; y: number }; duration: number };
 
 function CardFace({ card, mini }: { card: Card; mini?: boolean }) {
+  if (card.suit === 'jokers') {
+    return <div className={`card-face joker ${mini ? 'mini' : ''}`}><b className="corner tl"><SuitIcon suit="jokers" /></b><span className="joker-glyph">✦</span><b className="corner br"><SuitIcon suit="jokers" /></b></div>;
+  }
   const red = card.suit === 'hearts' || card.suit === 'diamonds';
   return <div className={`card-face ${red ? 'red' : ''} ${mini ? 'mini' : ''}`}>
     <b className="corner tl"><span className="rank">{card.rank}</span><SuitIcon suit={card.suit} /></b>
@@ -433,9 +458,10 @@ const SUIT_PATHS: Record<Suit, ReactNode> = {
   diamonds: <path d="M12 2.3c1.9 2.9 4.1 4.8 6.9 9.7-2.8 4.9-5 6.8-6.9 9.7-1.9-2.9-4.1-4.8-6.9-9.7 2.8-4.9 5-6.8 6.9-9.7z" />,
   clubs: <path d="M9.1 16.4c0-1.5.6-2.9 1.7-4.1a3.3 3.3 0 1 1 4.5-.1 5.4 5.4 0 0 1 .8 4.2l-1.5-.5c-.3 1-.7 1.9-1.4 2.6 1.2.4 2.4 1.2 3.3 2.4H8.5c.9-1.2 2.1-2 3.3-2.4a5.6 5.6 0 0 1-1.4-2.6l-1.3.5z" />,
   spades: <path d="M12 3c3.8 3 6.9 5.8 7.9 8.7a3.7 3.7 0 0 1-2.1 4.6c.1-1.6-.7-3-1.7-3.6V23h-8.2v-10.2c-1 .5-1.8 2-1.7 3.6a3.7 3.7 0 0 1-2.1-4.6C6 8.8 9.2 6 12 3z" />,
+  jokers: <path d="M12 4c1.6 2.4 4.4 3.6 6.8 2.4-.2 2.7 1.1 5.3 3.2 6.6-2.1 1.3-3.4 3.9-3.2 6.6-2.4-1.2-5.2 0-6.8 2.4-1.6-2.4-4.4-3.6-6.8-2.4.2-2.7-1.1-5.3-3.2-6.6 2.1-1.3 3.4-3.9 3.2-6.6 2.4 1.2 5.2 0 6.8-2.4z" />,
 };
 
-function SuitModal({ onPick }: { onPick: (s: Suit) => Promise<void> }) {
+function SuitModal({ onPick }: { onPick: (s: DeclareSuit) => Promise<void> }) {
   return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Choose a suit"><div className="suit-modal"><span className="eyebrow">WILD EIGHT</span><h3>Choose a suit</h3><div className="suit-grid">{SUITS.map(s => <button key={s} className={s === 'hearts' || s === 'diamonds' ? 'red-suit' : ''} onClick={() => void onPick(s)}><SuitIcon suit={s} /><small>{SUIT_NAME[s]}</small></button>)}</div></div></div>;
 }
 
@@ -498,7 +524,7 @@ async function runLocalAiTurns(state: GameState, ruleset: Ruleset, onLocalState:
   }
 }
 
-function localSnapshot(state: GameState, ruleset: Ruleset): GameSnapshot { const me = state.players.find(p => !p.isAI)!; return { publicState: { gameId: 'local', mode: 'solo_ai', status: state.phase === 'FINISHED' ? 'finished' : 'active', maxSeats: state.players.length, players: state.players.map(p => ({ seatIndex: p.seatIndex, displayName: p.displayName, isAI: p.isAI, connected: p.connected, cardCount: p.hand.length, replacedByAI: false })), turnSeatIndex: state.turnSeatIndex, topDiscard: state.discardPile[state.discardPile.length - 1] ?? null, currentSuit: state.currentSuit, drawCount: state.drawPile.length, direction: state.direction, hasDrawn: state.hasDrawn, winnerSeatIndex: state.winnerSeatIndex, version: state.version, ruleset, mySeatIndex: me.seatIndex, isHost: true }, myHand: me.hand, phase: state.phase }; }
+function localSnapshot(state: GameState, ruleset: Ruleset): GameSnapshot { const me = state.players.find(p => !p.isAI)!; return { publicState: { gameId: 'local', mode: 'solo_ai', status: state.phase === 'FINISHED' ? 'finished' : 'active', maxSeats: state.players.length, players: state.players.map(p => ({ seatIndex: p.seatIndex, displayName: p.displayName, isAI: p.isAI, connected: p.connected, cardCount: p.hand.length, replacedByAI: false })), turnSeatIndex: state.turnSeatIndex, topDiscard: state.discardPile[state.discardPile.length - 1] ?? null, currentSuit: state.currentSuit, drawCount: state.drawPile.length, direction: state.direction, hasDrawn: state.hasDrawn, pendingPickup: state.pendingPickup, carryOn: state.carryOn, winnerSeatIndex: state.winnerSeatIndex, version: state.version, ruleset, mySeatIndex: me.seatIndex, isHost: true }, myHand: me.hand, phase: state.phase }; }
 function initials(name: string) { return name.split(/\s+/).slice(0, 2).map(s => s[0]).join('').toUpperCase(); }
 function delay(ms: number) { return new Promise<void>(resolve => window.setTimeout(resolve, ms)); }
 function getGameIdFromPath() { const parts = window.location.pathname.split('/').filter(Boolean); const i = parts.indexOf('game'); return i >= 0 ? parts[i + 1] ?? null : null; }
